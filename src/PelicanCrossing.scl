@@ -1,0 +1,455 @@
+// ============================================================================
+// PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
+// SIEMENS S7-1200 - TIA PORTAL V21
+// Versi 0.5.1:
+//  1. Mode Default Sinyal Standby (State 0): Hijau Normal vs Flash Kuning Siaga
+//  2. Mode Kunci Acara / Parade (Force State 0 & Pause/Lock ON/OFF dari Jetson)
+//  3. Lampu Sorot Penyeberangan Terjadwal (Bisa diatur Jam & Menit Nyala/Padam secara dinamis via Reg 16..19)
+//  4. Dukungan 2 Tombol Push Button Independen (PB 1 & PB 2 Sisi Trotoar Berseberangan) & Pemisahan Pelanggaran
+//  5. Kontrol Buzzer State 5 ON/OFF dari Jetson
+//  6. Kontrol State Run / Pause di Posisi Terakhir & Direct Manual Jump (0 s/d 6)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. FUNCTION BLOCK: LOGIKA UTAMA PELICAN CROSSING
+// ----------------------------------------------------------------------------
+FUNCTION_BLOCK "FB_PelicanCrossing"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.5
+
+VAR_INPUT
+    btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
+    btn_Pedestrian_2     : Bool; // Tombol Pejalan Kaki Sisi 2 / Timur (%I0.1)
+    Clock_1Hz            : Bool; // Pulsa Detik dari System Memory PLC (%M0.5)
+    
+    // Parameter Konfigurasi & Kontrol dari Jetson (via Modbus Holding Registers):
+    cfg_BuzzerState5     : Bool; // Reg 8:  1 = Buzzer ON di State 5, 0 = OFF
+    cfg_DefaultMode      : Int;  // Reg 9:  Mode Standby State 0 (0 = Hijau Standby, 1 = Flash Kuning)
+    cfg_ParadeLock       : Bool; // Reg 10: Mode Parade/Acara (1 = Kunci State 0 & Pause, 0 = Normal)
+    cfg_StateRun         : Bool; // Reg 11: 1 = State ON (Berjalan), 0 = State PAUSE (Beku di posisi terakhir)
+    cfg_ManualState      : Int;  // Reg 12: Target State Manual (0 s/d 6) untuk lompat langsung (-1 = Idle)
+    cfg_FloodlightMode   : Int;  // Reg 13: Mode Lampu Sorot (0 = Auto Jadwal, 1 = Force ON, 2 = Force OFF)
+    cfg_FloodlightOnHour : Int;  // Reg 16: Jam Nyala Lampu Sorot (Default: 17)
+    cfg_FloodlightOnMin  : Int;  // Reg 17: Menit Nyala Lampu Sorot (Default: 30)
+    cfg_FloodlightOffHour: Int;  // Reg 18: Jam Padam Lampu Sorot (Default: 6)
+    cfg_FloodlightOffMin : Int;  // Reg 19: Menit Padam Lampu Sorot (Default: 0)
+    
+    // Konfigurasi Timer State 1 s/d 6 (Detik)
+    cfg_TimerState1      : Int;  // Reg 2: Waktu State 1 (detik)
+    cfg_TimerState2      : Int;  // Reg 3: Waktu State 2 (detik)
+    cfg_TimerState3      : Int;  // Reg 4: Waktu State 3 (detik)
+    cfg_TimerState4      : Int;  // Reg 5: Waktu State 4 (detik)
+    cfg_TimerState5      : Int;  // Reg 6: Waktu State 5 (detik)
+    cfg_TimerState6      : Int;  // Reg 7: Waktu State 6 (detik)
+END_VAR
+
+VAR_OUTPUT
+    out_Traffic_Green  : Bool; // Lampu Hijau Kendaraan
+    out_Traffic_Yellow : Bool; // Lampu Kuning Kendaraan
+    out_Traffic_Red    : Bool; // Lampu Merah Kendaraan
+    out_Ped_Green      : Bool; // Lampu Hijau Pejalan Kaki
+    out_Ped_Red        : Bool; // Lampu Merah Pejalan Kaki
+    out_Wait_Display   : Bool; // Indikator "TUNGGU" (Wait Display)
+    out_Buzzer         : Bool; // Buzzer Suara Pejalan Kaki
+    out_Floodlight     : Bool; // Lampu Sorot Penyeberangan Zebra Cross (Aktif Malam 17:30 - 06:00)
+    out_Violation_Side1: Int;  // Akumulasi Pelanggaran Tombol Sisi 1
+    out_Violation_Side2: Int;  // Akumulasi Pelanggaran Tombol Sisi 2
+END_VAR
+
+VAR
+    // Variabel Statis (Memory tersimpan antar cycle)
+    iState              : Int := 0;      // State Machine Aktif (0 - 6)
+    iTimerVal           : Int := 0;      // Penghitung Waktu Detik
+    iYellowTimer        : Int := 0;      // Penghitung Lampu Kuning 5 detik
+    bButtonLatched      : Bool := FALSE; // Status Tombol Ditekan & Pengunci
+    iButtonCounter_1    : Int := 0;      // Penghitung Tekanan Ekstra Tombol Sisi 1
+    iButtonCounter_2    : Int := 0;      // Penghitung Tekanan Ekstra Tombol Sisi 2
+    iViolation          : Int := 0;      // Total Akumulasi Pelanggaran
+    iViolation_1        : Int := 0;      // Pelanggaran Sisi 1
+    iViolation_2        : Int := 0;      // Pelanggaran Sisi 2
+    bBtnMem_1           : Bool := FALSE; // Memori Edge Tombol 1
+    bBtnMem_2           : Bool := FALSE; // Memori Edge Tombol 2
+    bSecMem             : Bool := FALSE; // Memori Edge Detik (1 Hz)
+    iLastManualStateCmd : Int := -1;     // Memori pendeteksi perubahan manual state
+    
+    // Waktu Lokal PLC untuk Lampu Sorot
+    dtLocalTime         : DTL;           // Struktur Waktu Real-Time PLC
+    iRetTime            : Int;           // Return Code pembacaan RTC
+    bFloodlightAuto     : Bool := FALSE; // Status Otomatis Lampu Sorot
+    
+    // Default Durasi Waktu Tiap State
+    iTimerState1        : Int := 10;     // Default Waktu State 1
+    iTimerState2        : Int := 3;      // Default Waktu State 2
+    iTimerState3        : Int := 3;      // Default Waktu State 3
+    iTimerState4        : Int := 20;     // Default Waktu State 4
+    iTimerState5        : Int := 3;      // Default Waktu State 5
+    iTimerState6        : Int := 60;     // Default Waktu State 6
+END_VAR
+
+VAR_TEMP
+    bBtnPulse_1 : Bool; // Pulsa 1 Cycle Tombol 1 Ditekan
+    bBtnPulse_2 : Bool; // Pulsa 1 Cycle Tombol 2 Ditekan
+    bBtnPulse   : Bool; // Pulsa Gabungan Tombol Ditekan
+    bSecPulse   : Bool; // Pulsa 1 Cycle Tiap 1 Detik
+
+    // Perhitungan Waktu Lampu Sorot
+    iFlOnH      : Int;  // Jam Nyala
+    iFlOnM      : Int;  // Menit Nyala
+    iFlOffH     : Int;  // Jam Padam
+    iFlOffM     : Int;  // Menit Padam
+    iCurMin     : Int;  // Menit Berjalan dari 00:00 (0..1439)
+    iOnMin      : Int;  // Menit Nyala dari 00:00 (0..1439)
+    iOffMin     : Int;  // Menit Padam dari 00:00 (0..1439)
+END_VAR
+
+BEGIN
+    // Update nilai timer dinamis dari Jetson jika valid (> 0)
+    IF #cfg_TimerState1 > 0 THEN #iTimerState1 := #cfg_TimerState1; END_IF;
+    IF #cfg_TimerState2 > 0 THEN #iTimerState2 := #cfg_TimerState2; END_IF;
+    IF #cfg_TimerState3 > 0 THEN #iTimerState3 := #cfg_TimerState3; END_IF;
+    IF #cfg_TimerState4 > 0 THEN #iTimerState4 := #cfg_TimerState4; END_IF;
+    IF #cfg_TimerState5 > 0 THEN #iTimerState5 := #cfg_TimerState5; END_IF;
+    IF #cfg_TimerState6 > 0 THEN #iTimerState6 := #cfg_TimerState6; END_IF;
+
+    // =========================================================================
+    // 0. KONTROL MANUAL LOMPAT STATE LANGSUNG DARI JETSON
+    // =========================================================================
+    IF (#cfg_ManualState >= 0) AND (#cfg_ManualState <= 6) AND (#cfg_ManualState <> #iLastManualStateCmd) THEN
+        #iState              := #cfg_ManualState;
+        #iTimerVal           := 0;
+        #iLastManualStateCmd := #cfg_ManualState;
+    ELSIF #cfg_ManualState < 0 THEN
+        #iLastManualStateCmd := -1;
+    END_IF;
+
+    // =========================================================================
+    // 1. PENDETEKSI PUSH BUTTON DUA SISI (RISING EDGE INDEPENDEN)
+    // Mendeteksi tombol sisi 1 dan sisi 2 secara terpisah untuk akurasi pelanggaran
+    // =========================================================================
+    #bBtnPulse_1 := #btn_Pedestrian_1 AND (NOT #bBtnMem_1);
+    #bBtnMem_1   := #btn_Pedestrian_1;
+
+    #bBtnPulse_2 := #btn_Pedestrian_2 AND (NOT #bBtnMem_2);
+    #bBtnMem_2   := #btn_Pedestrian_2;
+
+    #bBtnPulse   := #bBtnPulse_1 OR #bBtnPulse_2;
+
+    IF #bBtnPulse THEN
+        IF (#iState = 0 OR #iState = 6) AND (NOT #bButtonLatched) THEN
+            #bButtonLatched := TRUE;
+        ELSIF #bButtonLatched THEN
+            // Catat pelanggaran per sisi tombol secara akurat
+            IF #bBtnPulse_1 THEN #iButtonCounter_1 := #iButtonCounter_1 + 1; END_IF;
+            IF #bBtnPulse_2 THEN #iButtonCounter_2 := #iButtonCounter_2 + 1; END_IF;
+        END_IF;
+    END_IF;
+
+    // =========================================================================
+    // 2. LOGIKA KUNCI STATE / MODE ACARA / PARADE DARI JETSON
+    // Mau gimanapun kondisi state aktif saat ini (misal State 5), jika mode parade ON:
+    // FSM segera dipaksa ke State 0 dan membeku (terpause) di State 0!
+    // =========================================================================
+    IF #cfg_ParadeLock THEN
+        #iState           := 0;
+        #iTimerVal        := 0;
+        #bButtonLatched   := FALSE;
+        #iButtonCounter_1 := 0;
+        #iButtonCounter_2 := 0;
+    END_IF;
+
+    // =========================================================================
+    // 3. AKTIVASI TIMER 1 DETIK (Edge Clock 1 Hz) & LOGIKA PAUSE
+    // Timer HANYA bertambah jika State Run = TRUE dan tidak sedang dikunci parade.
+    // =========================================================================
+    #bSecPulse := #Clock_1Hz AND (NOT #bSecMem);
+    #bSecMem   := #Clock_1Hz;
+
+    IF (#iState <> 0) AND #bSecPulse AND #cfg_StateRun AND (NOT #cfg_ParadeLock) THEN 
+        #iTimerVal := #iTimerVal + 1;
+    END_IF;
+
+    // Timer untuk Kedip Lampu Kuning (berkedip selama State 0 Kuning atau State 1 Flash Kuning)
+    IF (#iState = 0 AND #cfg_DefaultMode = 1) AND #bSecPulse THEN
+        #iYellowTimer := (#iYellowTimer + 1) MOD 5;
+    ELSIF #iState <> 0 AND (#iState <> 1 OR #cfg_DefaultMode <> 1) THEN
+        #iYellowTimer := 0;
+    END_IF;
+
+    // =========================================================================
+    // 4. LOGIKA STATE MACHINE (FSM)
+    // =========================================================================
+    CASE #iState OF
+        0: // State 0 : Kondisi Standby / Normal (Bisa diset Hijau atau Flash Kuning)
+            IF #cfg_DefaultMode = 1 THEN
+                #out_Traffic_Green  := FALSE;
+                #out_Traffic_Yellow := (#iYellowTimer = 0); // Flash Kuning 1 Hz
+            ELSE
+                #out_Traffic_Green  := TRUE;                // Lampu Hijau Normal
+                #out_Traffic_Yellow := FALSE;
+            END_IF;
+            
+            #out_Traffic_Red    := FALSE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := FALSE;
+            #out_Buzzer         := FALSE;
+            
+            // Transisi ke State 1 hanya jika State ON, TIDAK dikunci Parade, dan tombol ditekan
+            IF #cfg_StateRun AND (NOT #cfg_ParadeLock) AND #bButtonLatched THEN 
+                #iTimerVal := 0;
+                #iState    := 1;
+            END_IF;
+
+        1: // State 1 : Traffic Standby (Fase persiapan kendaraan sebelum kuning)
+            IF #cfg_DefaultMode = 1 THEN
+                #out_Traffic_Green  := FALSE;
+                #out_Traffic_Yellow := (#iYellowTimer = 0);
+            ELSE
+                #out_Traffic_Green  := TRUE;
+                #out_Traffic_Yellow := FALSE;
+            END_IF;
+            
+            #out_Traffic_Red    := FALSE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := TRUE;
+            #out_Buzzer         := FALSE;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState1) THEN
+                #iTimerVal := 0;
+                #iState    := 2;
+            END_IF;
+            
+        2: // State 2 : Traffic Yellow Standby (Peringatan Kuning 3s)
+            #out_Traffic_Green  := FALSE;
+            #out_Traffic_Yellow := TRUE;
+            #out_Traffic_Red    := FALSE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := TRUE;
+            #out_Buzzer         := FALSE;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState2) THEN
+                #iTimerVal := 0; 
+                #iState    := 3;
+            END_IF;
+            
+        3: // State 3 : All Red 1 (Clearance Kendaraan 3s)
+            #out_Traffic_Green  := FALSE;
+            #out_Traffic_Yellow := FALSE;
+            #out_Traffic_Red    := TRUE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := TRUE;
+            #out_Buzzer         := FALSE;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState3) THEN
+                #iTimerVal := 0; 
+                #iState    := 4;
+            END_IF;
+            
+        4: // State 4 : Pedestrian Crossing (Pejalan Kaki Menyeberang 20s)
+            #out_Traffic_Green  := FALSE;
+            #out_Traffic_Yellow := FALSE;
+            #out_Traffic_Red    := TRUE;
+            #out_Ped_Green      := TRUE;
+            #out_Ped_Red        := FALSE;
+            #out_Wait_Display   := FALSE;
+            
+            // Buzzer Normal: Berbunyi tiap 2 detik (genap ON, ganjil OFF)
+            #out_Buzzer := (#iTimerVal MOD 2 = 0);
+            
+            // Buzzer Dipercepat jika waktu sisa <= 5 detik
+            IF #iTimerVal >= (#iTimerState4 - 5) THEN
+                #out_Buzzer := #Clock_1Hz;
+            END_IF;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState4) THEN
+                #iTimerVal := 0; 
+                #iState    := 5;
+            END_IF;
+            
+        5: // State 5 : All Red 2 (Hitung Pelanggaran & Settingan Buzzer Jetson)
+            #out_Traffic_Green  := FALSE;
+            #out_Traffic_Yellow := FALSE;
+            #out_Traffic_Red    := TRUE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := FALSE;
+            
+            // Kontrol Buzzer State 5 langsung dari Jetson (ON / OFF)
+            IF #cfg_BuzzerState5 THEN
+                #out_Buzzer := #Clock_1Hz;
+            ELSE
+                #out_Buzzer := FALSE;
+            END_IF;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState5) THEN
+                #iViolation_1      := #iViolation_1 + #iButtonCounter_1;
+                #iViolation_2      := #iViolation_2 + #iButtonCounter_2;
+                #iViolation        := #iViolation + #iButtonCounter_1 + #iButtonCounter_2;
+                #bButtonLatched    := FALSE;
+                #iButtonCounter_1  := 0;
+                #iButtonCounter_2  := 0;
+                #iTimerVal         := 0; 
+                #iState            := 6;
+            END_IF;
+            
+        6: // State 6 : Cooldown / Wait Before Normal (60s)
+            #out_Traffic_Green  := TRUE;
+            #out_Traffic_Yellow := FALSE;
+            #out_Traffic_Red    := FALSE;
+            #out_Ped_Green      := FALSE;
+            #out_Ped_Red        := TRUE;
+            #out_Wait_Display   := FALSE;
+            #out_Buzzer         := FALSE;
+            
+            IF #cfg_StateRun AND (#iTimerVal >= #iTimerState6) THEN
+                #iTimerVal := 0; 
+                IF #bButtonLatched THEN
+                    #iState := 1;
+                ELSE 
+                    #iState := 0;
+                END_IF;
+            END_IF;
+
+        ELSE
+            #iState := 0;
+    END_CASE;
+
+    // Output Data Pelanggaran Per Sisi
+    #out_Violation_Side1 := #iViolation_1;
+    #out_Violation_Side2 := #iViolation_2;
+
+    // =========================================================================
+    // 5. KONTROL LAMPU SOROT PENYEBERANGAN (FLOODLIGHT / SPOTLIGHT ZEBRA CROSS)
+    // Otomatis aktif sesuai jadwal (diset via Dashboard / Reg 16..19)
+    // dan bisa di-override (Force ON / Force OFF) dari Jetson
+    // =========================================================================
+    #iRetTime := RD_LOC_T(#dtLocalTime);
+
+    // Ambil parameter jadwal dari input (fallback ke default 17:30 - 06:00 jika kosong)
+    #iFlOnH  := #cfg_FloodlightOnHour;
+    #iFlOnM  := #cfg_FloodlightOnMin;
+    #iFlOffH := #cfg_FloodlightOffHour;
+    #iFlOffM := #cfg_FloodlightOffMin;
+
+    IF (#iFlOnH <= 0 AND #iFlOffH <= 0) THEN
+        #iFlOnH  := 17;
+        #iFlOnM  := 30;
+        #iFlOffH := 6;
+        #iFlOffM := 0;
+    END_IF;
+
+    #iCurMin := (#dtLocalTime.HOUR * 60) + #dtLocalTime.MINUTE;
+    #iOnMin  := (#iFlOnH * 60) + #iFlOnM;
+    #iOffMin := (#iFlOffH * 60) + #iFlOffM;
+
+    IF #iOnMin > #iOffMin THEN
+        // Jadwal melewati tengah malam (misal 17:30 s/d 06:00)
+        #bFloodlightAuto := (#iCurMin >= #iOnMin) OR (#iCurMin < #iOffMin);
+    ELSE
+        // Jadwal dalam satu hari yang sama (misal 08:00 s/d 18:00)
+        #bFloodlightAuto := (#iCurMin >= #iOnMin) AND (#iCurMin < #iOffMin);
+    END_IF;
+
+    IF #cfg_FloodlightMode = 1 THEN
+        #out_Floodlight := TRUE;             // Manual Force ON
+    ELSIF #cfg_FloodlightMode = 2 THEN
+        #out_Floodlight := FALSE;            // Manual Force OFF
+    ELSE
+        #out_Floodlight := #bFloodlightAuto; // Otomatis Berdasarkan Jam Jadwal RTC PLC
+    END_IF;
+
+END_FUNCTION_BLOCK
+
+
+// ----------------------------------------------------------------------------
+// 2. INSTANCE DATA BLOCK
+// ----------------------------------------------------------------------------
+DATA_BLOCK "DB_PelicanCrossing"
+"FB_PelicanCrossing"
+BEGIN
+END_DATA_BLOCK
+
+
+// ----------------------------------------------------------------------------
+// 3. MAIN BLOCK (OB1)
+// ----------------------------------------------------------------------------
+ORGANIZATION_BLOCK "Main"
+TITLE = "Main Program Block"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.5
+
+BEGIN
+    // Nilai Default Timer jika Register Modbus bernilai 0 (misal saat boot awal PLC)
+    IF "DB_Jetson_Comm".Holding_Data[2] <= 0 THEN "DB_Jetson_Comm".Holding_Data[2] := 10; END_IF; // Timer State 1
+    IF "DB_Jetson_Comm".Holding_Data[3] <= 0 THEN "DB_Jetson_Comm".Holding_Data[3] := 3;  END_IF; // Timer State 2
+    IF "DB_Jetson_Comm".Holding_Data[4] <= 0 THEN "DB_Jetson_Comm".Holding_Data[4] := 3;  END_IF; // Timer State 3
+    IF "DB_Jetson_Comm".Holding_Data[5] <= 0 THEN "DB_Jetson_Comm".Holding_Data[5] := 20; END_IF; // Timer State 4
+    IF "DB_Jetson_Comm".Holding_Data[6] <= 0 THEN "DB_Jetson_Comm".Holding_Data[6] := 3;  END_IF; // Timer State 5
+    IF "DB_Jetson_Comm".Holding_Data[7] <= 0 THEN "DB_Jetson_Comm".Holding_Data[7] := 60; END_IF; // Timer State 6
+
+    // Default State Run = 1 (State ON/Berjalan) jika belum pernah diatur
+    IF "DB_Jetson_Comm".Holding_Data[11] = 0 AND "DB_Jetson_Comm".Holding_Data[0] = 0 AND "DB_PelicanCrossing".iState = 0 AND "DB_PelicanCrossing".iTimerVal = 0 THEN
+        "DB_Jetson_Comm".Holding_Data[11] := 1;
+    END_IF;
+
+    // Default Jadwal Lampu Sorot (17:30 s/d 06:00) jika register kosong
+    IF "DB_Jetson_Comm".Holding_Data[16] <= 0 AND "DB_Jetson_Comm".Holding_Data[18] <= 0 THEN
+        "DB_Jetson_Comm".Holding_Data[16] := 17; // Jam Nyala
+        "DB_Jetson_Comm".Holding_Data[17] := 30; // Menit Nyala
+        "DB_Jetson_Comm".Holding_Data[18] := 6;  // Jam Padam
+        "DB_Jetson_Comm".Holding_Data[19] := 0;  // Menit Padam
+    END_IF;
+
+    // Pemanggilan FB Pelican Crossing dengan parameter Modbus dari Jetson & Tombol 2 Sisi
+    "DB_PelicanCrossing"(
+        btn_Pedestrian_1     := "btn_Pedestrian_1",                     // Input Fisik Tombol Sisi Barat (%I0.0)
+        btn_Pedestrian_2     := "btn_Pedestrian_2",                     // Input Fisik Tombol Sisi Timur (%I0.1)
+        Clock_1Hz            := "Clock_1Hz",                            // Clock 1 Hz (%M0.5)
+        cfg_BuzzerState5     := ("DB_Jetson_Comm".Holding_Data[8] <> 0),// Reg 8: Buzzer State 5
+        cfg_DefaultMode      := "DB_Jetson_Comm".Holding_Data[9],       // Reg 9: Mode Default Sinyal State 0 (0: Hijau, 1: Flash)
+        cfg_ParadeLock       := ("DB_Jetson_Comm".Holding_Data[10] <> 0),// Reg 10: Kunci Parade / Acara (Force State 0 & Pause)
+        cfg_StateRun         := ("DB_Jetson_Comm".Holding_Data[11] <> 0),// Reg 11: State Run (1: Run, 0: Pause)
+        cfg_ManualState      := "DB_Jetson_Comm".Holding_Data[12],      // Reg 12: Manual State Jump (0 s/d 6)
+        cfg_FloodlightMode   := "DB_Jetson_Comm".Holding_Data[13],      // Reg 13: Lampu Sorot (0: Auto Jadwal, 1: ON, 2: OFF)
+        cfg_FloodlightOnHour := "DB_Jetson_Comm".Holding_Data[16],      // Reg 16: Jam Nyala Lampu Sorot
+        cfg_FloodlightOnMin  := "DB_Jetson_Comm".Holding_Data[17],      // Reg 17: Menit Nyala Lampu Sorot
+        cfg_FloodlightOffHour:= "DB_Jetson_Comm".Holding_Data[18],      // Reg 18: Jam Padam Lampu Sorot
+        cfg_FloodlightOffMin := "DB_Jetson_Comm".Holding_Data[19],      // Reg 19: Menit Padam Lampu Sorot
+        cfg_TimerState1      := "DB_Jetson_Comm".Holding_Data[2],
+        cfg_TimerState2      := "DB_Jetson_Comm".Holding_Data[3],
+        cfg_TimerState3      := "DB_Jetson_Comm".Holding_Data[4],
+        cfg_TimerState4      := "DB_Jetson_Comm".Holding_Data[5],
+        cfg_TimerState5      := "DB_Jetson_Comm".Holding_Data[6],
+        cfg_TimerState6      := "DB_Jetson_Comm".Holding_Data[7],
+        out_Traffic_Green    => "out_Traffic_Green",                    // Output Sinyal Kendaraan (%Q0.0)
+        out_Traffic_Yellow   => "out_Traffic_Yellow",                   // Output Sinyal Kendaraan (%Q0.1)
+        out_Traffic_Red      => "out_Traffic_Red",                      // Output Sinyal Kendaraan (%Q0.2)
+        out_Ped_Green        => "out_Ped_Green",                        // Output Sinyal Pedestrian (%Q0.3)
+        out_Ped_Red          => "out_Ped_Red",                          // Output Sinyal Pedestrian (%Q0.4)
+        out_Wait_Display     => "out_Wait_Display",                     // Display Tunggu (%Q0.5)
+        out_Buzzer           => "out_Buzzer",                           // Buzzer Audio (%Q0.6)
+        out_Floodlight       => "out_Floodlight",                       // Lampu Sorot Zebra Cross (%Q0.7)
+        out_Violation_Side1  => "DB_Jetson_Comm".Holding_Data[14],      // Reg 14: Pelanggaran Sisi 1
+        out_Violation_Side2  => "DB_Jetson_Comm".Holding_Data[15]       // Reg 15: Pelanggaran Sisi 2
+    );
+
+    // Reset register perintah lompat manual state setelah dieksekusi agar siap menerima instruksi baru
+    IF "DB_Jetson_Comm".Holding_Data[12] >= 0 THEN
+        "DB_Jetson_Comm".Holding_Data[12] := -1;
+    END_IF;
+
+    // Kirim status State dan Akumulasi Pelanggaran ke Register Modbus untuk dibaca Jetson
+    "DB_Jetson_Comm".Holding_Data[0] := "DB_PelicanCrossing".iState;
+    "DB_Jetson_Comm".Holding_Data[1] := "DB_PelicanCrossing".iViolation;
+
+    // Modbus TCP Server (Port 502)
+    "MB_SERVER_DB_1"(
+        DISCONNECT  := FALSE,
+        CONNECT_ID  := 1,
+        IP_PORT     := 502,
+        MB_HOLD_REG := "DB_Jetson_Comm".Holding_Data
+    );
+END_ORGANIZATION_BLOCK

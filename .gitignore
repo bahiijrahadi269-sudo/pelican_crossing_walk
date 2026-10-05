@@ -1,0 +1,31 @@
+# ---- Siemens TIA Portal project files ----
+# Keep the exported .scl sources in git, not the binary project.
+*.ap1[0-9]
+*.ap2[0-9]
+*.zap1[0-9]
+*.zap2[0-9]
+*.al1[0-9]
+*.al2[0-9]
+AdditionalFiles/
+IM/
+Logs/
+System/
+TMP/
+UserFiles/
+XRef/
+Vci/
+
+# ---- Backups / archives ----
+*.zip
+*.bak
+*_backup*
+
+# ---- OS / editor ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.claude/
+
+# ---- Secrets ----
+.env

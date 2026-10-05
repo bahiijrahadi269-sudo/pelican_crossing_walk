@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+# TIA Portal sources are edited on Windows
+*.scl text eol=crlf
+*.md  text
