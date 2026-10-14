@@ -1,6 +1,18 @@
 // ============================================================================
 // PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
 // SIEMENS S7-1200 - TIA PORTAL V16 / V17 / V18 / V19 / V20 / V21
+// Versi 0.7.1 (Perbaikan dari v0.7, block VERSION 0.8):
+//  [FIX #1] Watchdog 1: soket lama diputus SETIAP 10 detik selama idle (v0.7 hanya sekali di
+//           detik ke-10 -> bila soket gantung lagi setelahnya, Jetson tidak bisa tersambung ulang).
+//  [FIX #2] Interlock dilengkapi:
+//           - Lompat ke State 5 saat kendaraan HIJAU (0/1/6) kini juga via Kuning (2) -> All Red (3) -> 5.
+//           - Lompat ke State 3/4/5 saat KUNING (2): kuning tidak dipotong, lanjut 2 -> 3 -> target.
+//           - Lompat ke State 2 saat pejalan kaki MENYEBERANG (4) kini via State 5 (clearance).
+//  [FIX #3] Counter idle Modbus (iMbIdleSec) dibatasi agar tidak overflow Int setelah +/- 9 jam.
+//  [FIX #4] Lompat manual ke State 0 / 6 kini menghitung pelanggaran yang tertunda lalu melepas
+//           latch tombol (v0.7: pelanggaran hilang / siklus baru berjalan sendiri). Lompat ke
+//           State 1..5 mengunci latch agar pelanggaran tetap dihitung di akhir State 5.
+//
 // Versi 0.7 (Safety Interlock & Autonomous Fail-Safe Edition):
 //  [SAFETY 1] INTERLOCK TRANSISI MANUAL (ANTI-TABRAKAN):
 //             Lompat manual ke State 4 (Crossing) saat kendaraan HIJAU (State 0/1/6)
@@ -40,7 +52,7 @@
 // ----------------------------------------------------------------------------
 FUNCTION_BLOCK "FB_PelicanCrossing"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.7
+VERSION : 0.8
 
 VAR_INPUT
     btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
@@ -156,23 +168,34 @@ BEGIN
     IF (#cfg_ManualState >= 0) AND (#cfg_ManualState <= 6) AND (#cfg_ManualState <> #iLastManualStateCmd) THEN
         #iLastManualStateCmd := #cfg_ManualState;
 
-        // [SAFETY INTERLOCK 1]: Permintaan ke State Menyeberang (State 3 / State 4) saat kendaraan sedang HIJAU (State 0, 1, 6)
+        // [SAFETY INTERLOCK 1]: Permintaan ke State kendaraan MERAH (State 3 / 4 / 5) saat kendaraan sedang HIJAU (State 0, 1, 6)
         // BAHAYA jika langsung lompat! Kendaraan butuh waktu pengereman.
-        // Interlock: Alihkan otomatis ke State 2 (Kuning) terlebih dahulu.
-        IF (#cfg_ManualState = 3 OR #cfg_ManualState = 4) AND (#iState = 0 OR #iState = 1 OR #iState = 6) THEN
+        // Interlock: Alihkan otomatis ke State 2 (Kuning) -> State 3 (All Red) -> target.
+        // [FIX #2] v0.7 belum mencakup target State 5 (kendaraan merah mendadak tanpa kuning).
+        IF (#cfg_ManualState >= 3 AND #cfg_ManualState <= 5) AND (#iState = 0 OR #iState = 1 OR #iState = 6) THEN
             #bInterlockActive   := TRUE;
             #iPendingTargetState:= #cfg_ManualState;
             #iState             := 2;   // Mulai dari Lampu Kuning Kendaraan (State 2)
             #iTimerVal          := 0;
             #bButtonLatched     := TRUE;
 
-        // [SAFETY INTERLOCK 2]: Permintaan ke Kendaraan HIJAU (State 0, 1, 6) saat pejalan kaki sedang MENYEBERANG (State 4)
-        // BAHAYA PEJALAN KAKI! Pejalan kaki sedang di zebra cross.
-        // Interlock: Alihkan otomatis ke State 5 (All Red Clearance) agar pejalan kaki selesai menepi dengan aman.
-        ELSIF (#cfg_ManualState = 0 OR #cfg_ManualState = 1 OR #cfg_ManualState = 6) AND (#iState = 4) THEN
+        // [SAFETY INTERLOCK 1B] [FIX #2]: Permintaan ke State 3 / 4 / 5 saat kendaraan sedang KUNING (State 2)
+        // v0.7 langsung lompat (2 -> 4 = pejalan kaki hijau tanpa All Red).
+        // Interlock: Kuning TIDAK dipotong (iState & iTimerVal tetap), lanjut normal 2 -> 3 -> target.
+        ELSIF (#cfg_ManualState >= 3 AND #cfg_ManualState <= 5) AND (#iState = 2) THEN
             #bInterlockActive   := TRUE;
             #iPendingTargetState:= #cfg_ManualState;
-            #iState             := 5;   // Beri clearance All Red (State 5) sebelum kendaraan hijau
+            #bButtonLatched     := TRUE;
+
+        // [SAFETY INTERLOCK 2]: Permintaan ke Kendaraan JALAN (State 0, 1, 2, 6) saat pejalan kaki sedang MENYEBERANG (State 4)
+        // BAHAYA PEJALAN KAKI! Pejalan kaki sedang di zebra cross.
+        // Interlock: Alihkan otomatis ke State 5 (All Red Clearance) agar pejalan kaki selesai menepi dengan aman.
+        // [FIX #2] v0.7 belum mencakup target State 2 (kendaraan kuning saat pejalan kaki masih hijau).
+        //          Target 1 / 2 / 6 berakhir di State 6 (Cooldown), target 0 berakhir di State 0.
+        ELSIF (#cfg_ManualState <= 2 OR #cfg_ManualState = 6) AND (#iState = 4) THEN
+            #bInterlockActive   := TRUE;
+            #iPendingTargetState:= #cfg_ManualState;
+            #iState             := 5;   // Beri clearance All Red (State 5) sebelum kendaraan jalan
             #iTimerVal          := 0;
 
         // [KASUS STANDAR]: Perpindahan aman lainnya (misal: lompat ke State 2 dari 0, atau lompat saat sudah all-red)
@@ -181,10 +204,21 @@ BEGIN
             #iPendingTargetState:= -1;
             #iState             := #cfg_ManualState;
             #iTimerVal          := 0;
-            IF #cfg_ManualState = 0 THEN
+
+            // [FIX #4] Atur latch tombol sesuai state tujuan
+            IF (#cfg_ManualState = 0) OR (#cfg_ManualState = 6) THEN
+                // Keluar dari siklus: hitung pelanggaran yang tertunda (sama seperti akhir State 5),
+                // lalu lepas latch agar State 6 tidak otomatis memulai siklus baru.
+                #iViolation_1     := #iViolation_1 + #iButtonCounter_1;
+                #iViolation_2     := #iViolation_2 + #iButtonCounter_2;
+                #iViolation       := #iViolation + #iButtonCounter_1 + #iButtonCounter_2;
                 #bButtonLatched   := FALSE;
                 #iButtonCounter_1 := 0;
                 #iButtonCounter_2 := 0;
+            ELSE
+                // Masuk ke tengah siklus (State 1..5): kunci latch agar tekanan tombol tetap dihitung
+                // sebagai pelanggaran dan dirangkum di akhir State 5.
+                #bButtonLatched   := TRUE;
             END_IF;
         END_IF;
 
@@ -306,8 +340,13 @@ BEGIN
 
             IF #cfg_StateRun AND (#iTimerVal >= #iTimerState3) THEN
                 #iTimerVal := 0;
-                #iState    := 4; // Lanjut ke Crossing
-                IF #bInterlockActive AND (#iPendingTargetState = 3 OR #iPendingTargetState = 4) THEN
+                // [FIX #2] Target interlock State 5: langsung ke All Red 2 tanpa fase menyeberang
+                IF #bInterlockActive AND (#iPendingTargetState = 5) THEN
+                    #iState := 5;
+                ELSE
+                    #iState := 4; // Lanjut ke Crossing
+                END_IF;
+                IF #bInterlockActive AND (#iPendingTargetState >= 3 AND #iPendingTargetState <= 5) THEN
                     #bInterlockActive    := FALSE;
                     #iPendingTargetState := -1;
                 END_IF;
@@ -471,7 +510,7 @@ END_DATA_BLOCK
 ORGANIZATION_BLOCK "Main"
 TITLE = "Main Program Block"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.7
+VERSION : 0.8
 
 VAR_TEMP
     bSecPulse : Bool;
@@ -589,10 +628,17 @@ BEGIN
         // Pulsa disconnect cukup 1 scan, lalu kembali listening
         "DB_PelicanSys".bMbDisconnect := FALSE;
     ELSIF #bSecPulse THEN
-        "DB_PelicanSys".iMbIdleSec := "DB_PelicanSys".iMbIdleSec + 1;
+        // [FIX #3] Batasi counter agar tidak overflow Int (32767 detik = +/- 9 jam).
+        // Setelah 3600 detik kembali ke 60 -> tetap >= 60 (fail-safe aktif) dan ritme 10 detik terjaga.
+        IF "DB_PelicanSys".iMbIdleSec >= 3600 THEN
+            "DB_PelicanSys".iMbIdleSec := 60;
+        ELSE
+            "DB_PelicanSys".iMbIdleSec := "DB_PelicanSys".iMbIdleSec + 1;
+        END_IF;
 
-        // [WATCHDOG 1]: 10 detik tanpa request -> putus koneksi lama (anti soket gantung 16#7002)
-        IF "DB_PelicanSys".iMbIdleSec = 10 THEN
+        // [WATCHDOG 1]: Setiap 10 detik tanpa request -> putus koneksi lama (anti soket gantung 16#7002)
+        // [FIX #1] v0.7 hanya sekali (= 10), kini diulang di detik 10, 20, 30, ... seperti v0.6.
+        IF ("DB_PelicanSys".iMbIdleSec MOD 10) = 0 THEN
             "DB_PelicanSys".bMbDisconnect := TRUE;
         END_IF;
 
