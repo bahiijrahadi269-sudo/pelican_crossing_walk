@@ -1,6 +1,12 @@
 // ============================================================================
 // PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
 // SIEMENS S7-1200 - TIA PORTAL V16 / V17 / V18 / V19 / V20 / V21
+// Versi 0.8 (dari v0.7.1, block VERSION 0.9):
+//  [BARU]   Buzzer State 4 aktif sejak PLC start: Reg 8 := 1 di blok inisialisasi OB1.
+//           (v0.7.1: Reg 8 tidak pernah diisi, nilainya 0 = mute, sehingga buzzer diam di State 4
+//            sampai Jetson menulis Reg 8 = 1.) Tetap bisa dimatikan dari Jetson setelah PLC start.
+//           Inisialisasi berjalan setiap PLC start (STOP -> RUN), karena DB_PelicanSys non-retain.
+//
 // Versi 0.7.1 (Perbaikan dari v0.7, block VERSION 0.8):
 //  [FIX #1] Watchdog 1: soket lama diputus SETIAP 10 detik selama idle (v0.7 hanya sekali di
 //           detik ke-10 -> bila soket gantung lagi setelahnya, Jetson tidak bisa tersambung ulang).
@@ -52,7 +58,7 @@
 // ----------------------------------------------------------------------------
 FUNCTION_BLOCK "FB_PelicanCrossing"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.8
+VERSION : 0.9
 
 VAR_INPUT
     btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
@@ -510,7 +516,7 @@ END_DATA_BLOCK
 ORGANIZATION_BLOCK "Main"
 TITLE = "Main Program Block"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.8
+VERSION : 0.9
 
 VAR_TEMP
     bSecPulse : Bool;
@@ -522,6 +528,7 @@ BEGIN
     // =========================================================================
     IF NOT "DB_PelicanSys".bInitDone THEN
         "DB_Jetson_Comm".Holding_Data[11] := 1;    // State Run = Jalan
+        "DB_Jetson_Comm".Holding_Data[8]  := 1;    // Buzzer State 4 = ON (v0.8; 0 = mute)
         "DB_Jetson_Comm".Holding_Data[12] := -1;   // Manual State = Idle
         IF ("DB_Jetson_Comm".Holding_Data[16] = 0) AND ("DB_Jetson_Comm".Holding_Data[17] = 0)
            AND ("DB_Jetson_Comm".Holding_Data[18] = 0) AND ("DB_Jetson_Comm".Holding_Data[19] = 0) THEN
