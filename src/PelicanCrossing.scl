@@ -1,6 +1,19 @@
 // ============================================================================
 // PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
 // SIEMENS S7-1200 - TIA PORTAL V16 / V17 / V18 / V19 / V20 / V21
+// Versi 0.8.1 (dari v0.8, block VERSION 1.0):
+//  [FIX]    Pelanggaran tombol dihitung PER SISI (tidak lagi memakai latch bersama hasil OR).
+//           v0.8: tekanan PERTAMA Sisi 2 setelah Sisi 1 meminta langsung dihitung pelanggaran Sisi 2.
+//           v0.8.1: tiap sisi punya latch permintaan sendiri (bSideReq_1 / bSideReq_2):
+//            - Tekanan pertama sisi itu dalam satu siklus  -> permintaan sah (tidak dihitung).
+//            - Tekanan berikutnya dari sisi yang sama      -> pelanggaran sisi itu.
+//            - Tekanan apa pun saat State 4 (pejalan kaki sudah hijau) -> pelanggaran sisi itu.
+//           bButtonLatched tetap dipakai sebagai pemicu siklus (cukup salah satu sisi meminta).
+//  [BARU]   Debounce 50 ms per tombol (TON tonDeb_1 / tonDeb_2): tombol harus stabil ditekan 50 ms
+//           sebelum dihitung, agar pantulan kontak tidak tercatat sebagai pelanggaran palsu.
+//           CATATAN: interface FB berubah -> instance DB_PelicanCrossing direinisialisasi saat download
+//           (akumulasi pelanggaran kembali 0). Ambil data logging dulu sebelum download.
+//
 // Versi 0.8 (dari v0.7.1, block VERSION 0.9):
 //  [BARU]   Buzzer State 4 aktif sejak PLC start: Reg 8 := 1 di blok inisialisasi OB1.
 //           (v0.7.1: Reg 8 tidak pernah diisi, nilainya 0 = mute, sehingga buzzer diam di State 4
@@ -58,7 +71,7 @@
 // ----------------------------------------------------------------------------
 FUNCTION_BLOCK "FB_PelicanCrossing"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.9
+VERSION : 1.0
 
 VAR_INPUT
     btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
@@ -105,7 +118,11 @@ END_VAR
 VAR
     iState              : Int := 0;      // State Machine Aktif (0 - 6)
     iTimerVal           : Int := 0;      // Penghitung Waktu Detik
-    bButtonLatched      : Bool := FALSE; // Status Tombol Ditekan & Pengunci
+    bButtonLatched      : Bool := FALSE; // Status Tombol Ditekan & Pengunci (pemicu siklus)
+    bSideReq_1          : Bool := FALSE; // Sisi 1 sudah meminta dalam siklus ini (v0.8.1)
+    bSideReq_2          : Bool := FALSE; // Sisi 2 sudah meminta dalam siklus ini (v0.8.1)
+    tonDeb_1            : TON_TIME;      // Debounce Tombol Sisi 1 (v0.8.1)
+    tonDeb_2            : TON_TIME;      // Debounce Tombol Sisi 2 (v0.8.1)
     iButtonCounter_1    : Int := 0;      // Penghitung Tekanan Ekstra Tombol Sisi 1
     iButtonCounter_2    : Int := 0;      // Penghitung Tekanan Ekstra Tombol Sisi 2
     iViolation          : Int := 0;      // Total Akumulasi Pelanggaran
@@ -136,7 +153,6 @@ END_VAR
 VAR_TEMP
     bBtnPulse_1 : Bool;
     bBtnPulse_2 : Bool;
-    bBtnPulse   : Bool;
     bSecPulse   : Bool;
     iFlOnH      : Int;
     iFlOnM      : Int;
@@ -219,6 +235,8 @@ BEGIN
                 #iViolation_2     := #iViolation_2 + #iButtonCounter_2;
                 #iViolation       := #iViolation + #iButtonCounter_1 + #iButtonCounter_2;
                 #bButtonLatched   := FALSE;
+                #bSideReq_1       := FALSE;
+                #bSideReq_2       := FALSE;
                 #iButtonCounter_1 := 0;
                 #iButtonCounter_2 := 0;
             ELSE
@@ -233,23 +251,38 @@ BEGIN
     END_IF;
 
     // =========================================================================
-    // 1. PENDETEKSI PUSH BUTTON DUA SISI (RISING EDGE INDEPENDEN)
+    // 1. PENDETEKSI PUSH BUTTON DUA SISI (RISING EDGE & PELANGGARAN PER SISI)
     // =========================================================================
-    #bBtnPulse_1 := #btn_Pedestrian_1 AND (NOT #bBtnMem_1);
-    #bBtnMem_1   := #btn_Pedestrian_1;
+    // [v0.8.1] Debounce: Q baru TRUE setelah tombol stabil ditekan 50 ms. Pantulan saat ditekan
+    // me-restart timer, pantulan saat dilepas tidak sempat mencapai 50 ms -> tidak ada pulsa ganda.
+    #tonDeb_1(IN := #btn_Pedestrian_1, PT := T#50ms);
+    #tonDeb_2(IN := #btn_Pedestrian_2, PT := T#50ms);
 
-    #bBtnPulse_2 := #btn_Pedestrian_2 AND (NOT #bBtnMem_2);
-    #bBtnMem_2   := #btn_Pedestrian_2;
+    #bBtnPulse_1 := #tonDeb_1.Q AND (NOT #bBtnMem_1);
+    #bBtnMem_1   := #tonDeb_1.Q;
 
-    #bBtnPulse   := #bBtnPulse_1 OR #bBtnPulse_2;
+    #bBtnPulse_2 := #tonDeb_2.Q AND (NOT #bBtnMem_2);
+    #bBtnMem_2   := #tonDeb_2.Q;
 
-    IF #bBtnPulse THEN
-        IF (#iState = 0 OR #iState = 6) AND (NOT #bButtonLatched) THEN
-            #bButtonLatched := TRUE;
-        ELSIF #bButtonLatched THEN
-            IF #bBtnPulse_1 THEN #iButtonCounter_1 := #iButtonCounter_1 + 1; END_IF;
-            IF #bBtnPulse_2 THEN #iButtonCounter_2 := #iButtonCounter_2 + 1; END_IF;
+    // [v0.8.1] Tiap sisi diproses sendiri: tekanan pertama sisi itu = permintaan sah,
+    // tekanan berikutnya / tekanan saat State 4 = pelanggaran sisi itu.
+    // Tekanan hanya diterima di State 0/6, atau saat siklus sudah berjalan (bButtonLatched).
+    IF #bBtnPulse_1 AND ((#iState = 0) OR (#iState = 6) OR #bButtonLatched) THEN
+        IF #bSideReq_1 OR (#iState = 4) THEN
+            #iButtonCounter_1 := #iButtonCounter_1 + 1;
+        ELSE
+            #bSideReq_1 := TRUE;
         END_IF;
+        #bButtonLatched := TRUE;
+    END_IF;
+
+    IF #bBtnPulse_2 AND ((#iState = 0) OR (#iState = 6) OR #bButtonLatched) THEN
+        IF #bSideReq_2 OR (#iState = 4) THEN
+            #iButtonCounter_2 := #iButtonCounter_2 + 1;
+        ELSE
+            #bSideReq_2 := TRUE;
+        END_IF;
+        #bButtonLatched := TRUE;
     END_IF;
 
     // =========================================================================
@@ -259,6 +292,8 @@ BEGIN
         #iState             := 0;
         #iTimerVal          := 0;
         #bButtonLatched     := FALSE;
+        #bSideReq_1         := FALSE;
+        #bSideReq_2         := FALSE;
         #iButtonCounter_1   := 0;
         #iButtonCounter_2   := 0;
         #bInterlockActive   := FALSE;
@@ -393,6 +428,8 @@ BEGIN
                 #iViolation_2      := #iViolation_2 + #iButtonCounter_2;
                 #iViolation        := #iViolation + #iButtonCounter_1 + #iButtonCounter_2;
                 #bButtonLatched    := FALSE;
+                #bSideReq_1        := FALSE;
+                #bSideReq_2        := FALSE;
                 #iButtonCounter_1  := 0;
                 #iButtonCounter_2  := 0;
                 #iTimerVal         := 0;
@@ -516,7 +553,7 @@ END_DATA_BLOCK
 ORGANIZATION_BLOCK "Main"
 TITLE = "Main Program Block"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.9
+VERSION : 1.0
 
 VAR_TEMP
     bSecPulse : Bool;
