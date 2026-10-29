@@ -5,8 +5,8 @@ PLC program for a **pelican crossing** (pedestrian-activated traffic light), wri
 The PLC runs the signal sequence on its own and acts as a **Modbus TCP server**, so an
 edge computer (NVIDIA Jetson) can monitor it and change its settings remotely.
 
-> Supervisory / gateway side (Python, Modbus client on the Jetson):
-> [1212kyyy/pelican-crosing-ai](https://github.com/1212kyyy/pelican-crosing-ai)
+> Companion repo – Python Modbus TCP monitor and control terminal running on the Jetson:
+> [bahiijrahadi269-sudo/pelican-crossing-modbus](https://github.com/bahiijrahadi269-sudo/pelican-crossing-modbus)
 
 ## Highlights
 
