@@ -1,6 +1,17 @@
 // ============================================================================
 // PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
 // SIEMENS S7-1200 - TIA PORTAL V16 / V17 / V18 / V19 / V20 / V21
+// Versi 0.8.3 (dari v0.8.2, block VERSION 1.2):
+//  [BARU]   Reg 24 / 25 = pelanggaran Sisi 1 / Sisi 2 pada siklus yang sedang berjalan
+//           (iButtonCounter_1 / _2), agar web bisa menampilkan pelanggaran sebelum akhir State 5.
+//  [FIX]    Parade Lock kini menjumlahkan pelanggaran siklus berjalan ke akumulasi sebelum
+//           counter di-nol-kan (v0.8.2: pelanggaran siklus itu hilang).
+//  [FIX]    Cegah overflow Int: bila iViolation / iViolation_1 / iViolation_2 > 30000, ketiganya
+//           kembali 0 (data lama tetap tersimpan di database Jetson).
+//  [UBAH]   RD_LOC_T dipanggil dengan bentuk formal: RD_LOC_T(OUT => #dtLocalTime).
+//           Jam CPU harus WIB: Properties CPU -> Time of day -> UTC+7, lalu Online -> Set time.
+//           Tidak ada variabel baru -> interface FB sama dengan v0.8.2.
+//
 // Versi 0.8.2 (dari v0.8.1, block VERSION 1.1):
 //  [UBAH]   Aturan pelanggaran "no excuses" (ada display yang menyuruh cukup tekan sekali):
 //            - Tekanan PERTAMA dalam satu siklus, dari sisi mana pun -> permintaan sah (tidak dihitung).
@@ -73,7 +84,9 @@
 //  Reg 21     : Detik berjalan pada state aktif             PLC  -> Jetson
 //  Reg 22     : Heartbeat PLC                               PLC  -> Jetson
 //  Reg 23     : Reset akumulasi pelanggaran (1=reset, auto-clear oleh PLC)  Jetson -> PLC
-//  Reg 24..29 : Cadangan
+//  Reg 24     : Pelanggaran Sisi 1, siklus berjalan (v0.8.3)  PLC  -> Jetson
+//  Reg 25     : Pelanggaran Sisi 2, siklus berjalan (v0.8.3)  PLC  -> Jetson
+//  Reg 26..29 : Cadangan
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -81,7 +94,7 @@
 // ----------------------------------------------------------------------------
 FUNCTION_BLOCK "FB_PelicanCrossing"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 1.1
+VERSION : 1.2
 
 VAR_INPUT
     btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
@@ -286,6 +299,11 @@ BEGIN
     // 2. KUNCI STATE / MODE ACARA / PARADE
     // =========================================================================
     IF #cfg_ParadeLock THEN
+        // [v0.8.3] Simpan pelanggaran siklus berjalan sebelum counter di-nol-kan
+        // (scan berikutnya counter sudah 0, jadi tidak terhitung dobel).
+        #iViolation_1       := #iViolation_1 + #iButtonCounter_1;
+        #iViolation_2       := #iViolation_2 + #iButtonCounter_2;
+        #iViolation         := #iViolation + #iButtonCounter_1 + #iButtonCounter_2;
         #iState             := 0;
         #iTimerVal          := 0;
         #bButtonLatched     := FALSE;
@@ -465,6 +483,13 @@ BEGIN
         #out_Buzzer := FALSE;
     END_IF;
 
+    // [v0.8.3] Cegah overflow Int: kembali 0 (data lama aman di database Jetson)
+    IF (#iViolation > 30000) OR (#iViolation_1 > 30000) OR (#iViolation_2 > 30000) THEN
+        #iViolation   := 0;
+        #iViolation_1 := 0;
+        #iViolation_2 := 0;
+    END_IF;
+
     #out_Violation_Side1 := #iViolation_1;
     #out_Violation_Side2 := #iViolation_2;
     #out_TimerVal        := #iTimerVal;
@@ -473,7 +498,7 @@ BEGIN
     // =========================================================================
     // 5. LAMPU SOROT ZEBRA CROSS (Jadwal RTC + Override dari Jetson)
     // =========================================================================
-    #iRetTime := RD_LOC_T(#dtLocalTime);
+    #iRetTime := RD_LOC_T(OUT => #dtLocalTime);   // [v0.8.3] bentuk formal sesuai dokumentasi Siemens
 
     #iFlOnH  := #cfg_FloodlightOnHour;
     #iFlOnM  := #cfg_FloodlightOnMin;
@@ -546,7 +571,7 @@ END_DATA_BLOCK
 ORGANIZATION_BLOCK "Main"
 TITLE = "Main Program Block"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 1.1
+VERSION : 1.2
 
 VAR_TEMP
     bSecPulse : Bool;
@@ -631,6 +656,9 @@ BEGIN
     // =========================================================================
     "DB_Jetson_Comm".Holding_Data[0] := "DB_PelicanCrossing".iState;
     "DB_Jetson_Comm".Holding_Data[1] := "DB_PelicanCrossing".iViolation;
+    // [v0.8.3] Pelanggaran siklus yang sedang berjalan (dirangkum ke Reg 14/15 di akhir State 5)
+    "DB_Jetson_Comm".Holding_Data[24] := "DB_PelicanCrossing".iButtonCounter_1;  // Sisi 1
+    "DB_Jetson_Comm".Holding_Data[25] := "DB_PelicanCrossing".iButtonCounter_2;  // Sisi 2
 
     // Bitmask status output fisik (Reg 20)
     "DB_PelicanSys".iOutMask := 0;
