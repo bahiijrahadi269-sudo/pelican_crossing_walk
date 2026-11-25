@@ -1,6 +1,15 @@
 // ============================================================================
 // PROGRAM PELICAN CROSSING (LAMPU PENYEBERANGAN PEJALAN KAKI)
 // SIEMENS S7-1200 - TIA PORTAL V16 / V17 / V18 / V19 / V20 / V21
+// Versi 0.8.4 (dari v0.8.3, block VERSION 1.3):
+//  [UBAH]   Buzzer State 4 berbunyi 250 ms ON / 250 ms OFF selama seluruh State 4
+//           (v0.8.3: 1 s / 1 s, lalu 0,5 s / 0,5 s di 5 detik terakhir). Memakai Clock Memory 2 Hz (%M0.3).
+//  [BARU]   Lampu indikator State 0..6 di modul SM 1222 RLY: %Q8.0 .. %Q8.6 (%Q8.7 cadangan).
+//           TAG BARU di PLC tag table: Clock_2Hz = %M0.3, out_StateLamp_0..6 = %Q8.0..%Q8.6
+//           (hapus / ganti tag lama "TestOut" di %Q8.0).
+//           CATATAN: interface FB berubah (input Clock_2Hz) -> instance DB_PelicanCrossing
+//           direinisialisasi saat download (akumulasi pelanggaran kembali 0).
+//
 // Versi 0.8.3 (dari v0.8.2, block VERSION 1.2):
 //  [BARU]   Reg 24 / 25 = pelanggaran Sisi 1 / Sisi 2 pada siklus yang sedang berjalan
 //           (iButtonCounter_1 / _2), agar web bisa menampilkan pelanggaran sebelum akhir State 5.
@@ -94,12 +103,13 @@
 // ----------------------------------------------------------------------------
 FUNCTION_BLOCK "FB_PelicanCrossing"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 1.2
+VERSION : 1.3
 
 VAR_INPUT
     btn_Pedestrian_1     : Bool; // Tombol Pejalan Kaki Sisi 1 / Barat (%I0.0)
     btn_Pedestrian_2     : Bool; // Tombol Pejalan Kaki Sisi 2 / Timur (%I0.1)
     Clock_1Hz            : Bool; // Pulsa Detik dari System Memory PLC (%M0.5)
+    Clock_2Hz            : Bool; // Clock 2 Hz dari Clock Memory PLC (%M0.3) - buzzer 250 ms (v0.8.4)
 
     // Parameter Konfigurasi & Kontrol dari Jetson (via Modbus Holding Registers):
     cfg_BuzzerCross      : Bool; // Reg 8: Kontrol Buzzer saat State 4 (Crossing) (1=ON, 0=MUTE)
@@ -414,11 +424,9 @@ BEGIN
             #out_Ped_Red        := FALSE;
 
             // Kontrol Suara Buzzer saat Pejalan Kaki Menyeberang (Reg 8: 1=Buzzer ON, 0=Mute)
+            // [v0.8.4] Seluruh State 4 berbunyi 250 ms ON / 250 ms OFF (Clock 2 Hz, %M0.3)
             IF #cfg_BuzzerCross THEN
-                #out_Buzzer := (#iTimerVal MOD 2 = 0);
-                IF #iTimerVal >= (#iTimerState4 - 5) THEN
-                    #out_Buzzer := #Clock_1Hz;
-                END_IF;
+                #out_Buzzer := #Clock_2Hz;
             ELSE
                 #out_Buzzer := FALSE;
             END_IF;
@@ -571,7 +579,7 @@ END_DATA_BLOCK
 ORGANIZATION_BLOCK "Main"
 TITLE = "Main Program Block"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 1.2
+VERSION : 1.3
 
 VAR_TEMP
     bSecPulse : Bool;
@@ -610,7 +618,8 @@ BEGIN
         btn_Pedestrian_1     := "btn_Pedestrian_1",
         btn_Pedestrian_2     := "btn_Pedestrian_2",
         Clock_1Hz            := "Clock_1Hz",
-        cfg_BuzzerCross      := ("DB_Jetson_Comm".Holding_Data[8] <> 0),
+        Clock_2Hz            := "Clock_2Hz",            // %M0.3
+        cfg_BuzzerCross     := ("DB_Jetson_Comm".Holding_Data[8] <> 0),
         cfg_DefaultMode      := "DB_Jetson_Comm".Holding_Data[9],
         cfg_ParadeLock       := ("DB_Jetson_Comm".Holding_Data[10] <> 0),
         cfg_StateRun         := ("DB_Jetson_Comm".Holding_Data[11] <> 0),
@@ -640,6 +649,16 @@ BEGIN
         out_TimerVal         => "DB_Jetson_Comm".Holding_Data[21],
         out_Heartbeat        => "DB_Jetson_Comm".Holding_Data[22]
     );
+
+    // [v0.8.4] Lampu indikator state di panel (SM 1222 RLY) - satu lampu menyala = state aktif
+    "out_StateLamp_0" := ("DB_PelicanCrossing".iState = 0);   // %Q8.0 Standby
+    "out_StateLamp_1" := ("DB_PelicanCrossing".iState = 1);   // %Q8.1 Persiapan
+    "out_StateLamp_2" := ("DB_PelicanCrossing".iState = 2);   // %Q8.2 Kuning
+    "out_StateLamp_3" := ("DB_PelicanCrossing".iState = 3);   // %Q8.3 All Red 1
+    "out_StateLamp_4" := ("DB_PelicanCrossing".iState = 4);   // %Q8.4 Crossing
+    "out_StateLamp_5" := ("DB_PelicanCrossing".iState = 5);   // %Q8.5 All Red 2
+    "out_StateLamp_6" := ("DB_PelicanCrossing".iState = 6);   // %Q8.6 Cooldown
+    // %Q8.7 : SPARE
 
     // Reset perintah lompat manual setelah dieksekusi (auto-clear)
     IF "DB_Jetson_Comm".Holding_Data[12] >= 0 THEN

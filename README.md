@@ -49,7 +49,7 @@ stateDiagram-v2
 | 1 Request accepted | Green (or flashing amber) | Red | 10 s |
 | 2 Caution | Amber | Red | 3 s |
 | 3 All red 1 | Red | Red | 3 s |
-| 4 Crossing | Red | Green + buzzer | 20 s |
+| 4 Crossing | Red | Green + buzzer (250 ms on / off) | 20 s |
 | 5 All red 2 | Red | Red | 3 s |
 | 6 Cooldown | Green | Red | 60 s |
 
@@ -81,6 +81,7 @@ All blocks are in a single source file, [`src/PelicanCrossing.scl`](src/PelicanC
 | `btn_Pedestrian_1` | `%I0.0` | Pedestrian push button, side 1 (west) |
 | `btn_Pedestrian_2` | `%I0.1` | Pedestrian push button, side 2 (east) |
 | `Clock_1Hz` | `%M0.5` | 1 Hz pulse from the CPU clock memory byte (MB0) |
+| `Clock_2Hz` | `%M0.3` | 2 Hz pulse from the clock memory byte (buzzer 250 ms on / 250 ms off) |
 | `out_Traffic_Green` | `%Q0.0` | Vehicle green |
 | `out_Traffic_Yellow` | `%Q0.1` | Vehicle amber |
 | `out_Traffic_Red` | `%Q0.2` | Vehicle red |
@@ -89,6 +90,8 @@ All blocks are in a single source file, [`src/PelicanCrossing.scl`](src/PelicanC
 | — | `%Q0.5` | Spare |
 | `out_Buzzer` | `%Q0.6` | Pedestrian buzzer |
 | `out_Floodlight` | `%Q0.7` | Zebra-crossing floodlight |
+| `out_StateLamp_0` … `out_StateLamp_6` | `%Q8.0` … `%Q8.6` | State indicator panel, one lamp per state 0–6 (SM 1222 RLY) |
+| — | `%Q8.7` | Spare |
 
 ## Modbus TCP interface
 
@@ -130,7 +133,7 @@ Developed in TIA Portal V21. The source only uses standard S7-1200 instructions
 
 ## Version history
 
-Each release is a git tag (`v0.5` … `v0.8.3`), and each change is a commit on `src/PelicanCrossing.scl`.
+Each release is a git tag (`v0.5` … `v0.8.4`), and each change is a commit on `src/PelicanCrossing.scl`.
 See [`CHANGELOG.md`](CHANGELOG.md) for details.
 
 | Version | Main change |
@@ -143,6 +146,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for details.
 | v0.8.1 | 50 ms button debounce, per-side violation logic |
 | v0.8.2 | Simplified "first press only" violation rule |
 | v0.8.3 | Live per-cycle violation registers, Int overflow guard |
+| v0.8.4 | 250 ms crossing buzzer, state indicator lamps on `%Q8.0`–`%Q8.6` |
 
 ## Author
 

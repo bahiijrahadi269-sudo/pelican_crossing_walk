@@ -2,6 +2,12 @@
 
 The full change notes (in Indonesian) are also kept in the header of `src/PelicanCrossing.scl`.
 
+## v0.8.4 – FB version 1.3
+- **Change:** the crossing buzzer beeps 250 ms on / 250 ms off for the whole of state 4 (was 1 s / 1 s, then 0.5 s / 0.5 s in the last 5 s). It uses the 2 Hz clock memory bit `%M0.3`; the buzzer output stays on `%Q0.6`.
+- **New:** state indicator panel on an SM 1222 RLY module: states 0–6 light `%Q8.0`–`%Q8.6` (`%Q8.7` spare).
+- New PLC tags: `Clock_2Hz` (`%M0.3`), `out_StateLamp_0`…`out_StateLamp_6` (`%Q8.0`–`%Q8.6`).
+- FB interface changed (new input `Clock_2Hz`): the instance DB is reinitialised on download.
+
 ## v0.8.3 – FB version 1.2
 - **New:** registers 24 / 25 expose violations of the running cycle per side, so the dashboard can show them before the end of state 5.
 - **Fix:** Parade Lock now adds the running cycle's violations to the totals before clearing the counters (v0.8.2 lost them).
